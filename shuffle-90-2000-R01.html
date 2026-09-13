@@ -287,7 +287,7 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
   </section>
 
-  <footer>R01 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
+  <footer>R02 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
 </div>
 
 <script>
@@ -498,23 +498,50 @@ async function collectPlaylists(pool, from, to, lines){
 
 async function collectSearch(pool, from, to, terms, cap){
   const list = terms.length ? terms : ["pop","rock","dance","hip hop","r&b","alternative","italiana"];
+  const market = /^[A-Za-z]{2}$/.test(me && me.country || "") ? me.country.toUpperCase() : null;
+  log("Mercato usato per la ricerca: "+(market || "nessuno (parametro omesso)"));
+
+  let firstError = true;
   for (const term of list){
     if (pool.size >= cap*2) break;
     const before = pool.size;
+    let ricevuti = 0, fuoriPeriodo = 0, errore = null;
+
     for (let offset=0; offset<200; offset+=50){
       const q = encodeURIComponent(term+" year:"+from+"-"+to);
+      let url = "/search?q="+q+"&type=track&limit=50&offset="+offset;
+      if (market) url += "&market="+market;
       let page;
-      try { page = await api("/search?q="+q+"&type=track&limit=50&offset="+offset+"&market="+(me.country||"IT")); }
-      catch(e){ break; }
+      try {
+        page = await api(url);
+      } catch(e){
+        errore = e.message;
+        // un solo tentativo di ripiego, senza market: alcuni account lo rifiutano
+        if (market){
+          try { page = await api("/search?q="+q+"&type=track&limit=50&offset="+offset); errore = null; }
+          catch(e2){ errore = e2.message; }
+        }
+        if (errore) break;
+      }
       const items = (page.tracks && page.tracks.items) || [];
+      ricevuti += items.length;
       if (!items.length) break;
       for (const t of items){
         if (!usable(t)) continue;
         const y = yearOf(t);
-        if (y >= from && y <= to) pool.set(t.id, t);
+        if (y >= from && y <= to) pool.set(t.id, t); else fuoriPeriodo++;
       }
     }
-    log("Ricerca « "+term+" » → +"+(pool.size-before)+" brani", "good");
+
+    if (errore){
+      log("Ricerca « "+term+" » fallita → "+errore, "bad");
+      if (firstError){
+        firstError = false;
+        log("Suggerimento: se l'errore è 403, l'app sul dashboard Spotify è in modalità sviluppo e il tuo account non è fra gli utenti abilitati. Aggiungilo in User Management.", "bad");
+      }
+    } else {
+      log("Ricerca « "+term+" »: "+ricevuti+" risultati, "+(ricevuti-fuoriPeriodo)+" nel periodo → totale "+pool.size, ricevuti ? "good" : "bad");
+    }
   }
 }
 
