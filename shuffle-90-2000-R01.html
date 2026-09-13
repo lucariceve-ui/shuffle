@@ -226,23 +226,27 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </label>
 
     <label class="check">
-      <input type="checkbox" id="srcPlaylists">
-      <span>Playlist specifiche
-        <em>Incolla i link di playlist tipo All Out 90s, All Out 2000s.</em></span>
+      <input type="checkbox" id="srcMine">
+      <span>Le mie playlist
+        <em>Scegli fra le playlist che hai creato o che segui.</em></span>
     </label>
-    <div class="sub" id="subPlaylists">
-      <textarea id="playlistUrls" placeholder="https://open.spotify.com/playlist/37i9dQZF1DXbTxeAdrVG2l&#10;https://open.spotify.com/playlist/37i9dQZF1DX1vSJnMeoy3V" spellcheck="false"></textarea>
-      <p class="hint" style="margin:6px 0 0">Un link per riga. Su Spotify: tre puntini → Condividi → Copia link.</p>
+    <div class="sub" id="subMine">
+      <button class="small" id="btnLoadMine" type="button">Carica l'elenco</button>
+      <div id="mineList" style="margin-top:10px"></div>
     </div>
 
     <label class="check">
-      <input type="checkbox" id="srcSearch">
-      <span>Cerca nel catalogo Spotify
-        <em>Pesca brani nuovi per te dentro il periodo scelto.</em></span>
+      <input type="checkbox" id="srcPlaylists">
+      <span>Playlist da link
+        <em>Incolla i link di playlist create da utenti, non da Spotify.</em></span>
     </label>
-    <div class="sub" id="subSearch">
-      <input type="text" id="searchTerms" placeholder="pop, rock, dance, hip hop, italiana" spellcheck="false">
-      <p class="hint" style="margin:6px 0 0">Generi o parole chiave separati da virgola. Lascia vuoto per un mix generalista.</p>
+    <div class="sub" id="subPlaylists">
+      <textarea id="playlistUrls" placeholder="https://open.spotify.com/playlist/..." spellcheck="false"></textarea>
+      <p class="hint" style="margin:6px 0 0">Un link per riga. Su Spotify: tre puntini → Condividi → Copia link.</p>
+    </div>
+
+    <div class="warn" style="margin-top:14px">
+      Le playlist ufficiali Spotify (All Out 90s e simili, quelle con codice che inizia per 37i9dQ) e la ricerca nel catalogo non sono accessibili alle app registrate da privati: Spotify le ha chiuse nel novembre 2024. Per usarne il contenuto, aprila su Spotify, seleziona tutti i brani e copiali in una tua playlist: quella diventa leggibile.
     </div>
   </section>
 
@@ -287,7 +291,7 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
   </section>
 
-  <footer>R02 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
+  <footer>R03 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
 </div>
 
 <script>
@@ -472,6 +476,10 @@ async function collectPlaylists(pool, from, to, lines){
   for (const line of lines){
     const id = playlistId(line.trim());
     if (!id){ log("Link non riconosciuto: "+line.slice(0,40), "bad"); continue; }
+    if (id.startsWith("37i9dQ")){
+      log("Playlist ufficiale Spotify: non accessibile alle app private. Copiane i brani in una tua playlist.", "bad");
+      continue;
+    }
     let url = "/playlists/"+id+"/tracks?limit=100&additional_types=track";
     let before = pool.size, name = id;
     try {
@@ -496,53 +504,38 @@ async function collectPlaylists(pool, from, to, lines){
   }
 }
 
-async function collectSearch(pool, from, to, terms, cap){
-  const list = terms.length ? terms : ["pop","rock","dance","hip hop","r&b","alternative","italiana"];
-  const market = /^[A-Za-z]{2}$/.test(me && me.country || "") ? me.country.toUpperCase() : null;
-  log("Mercato usato per la ricerca: "+(market || "nessuno (parametro omesso)"));
-
-  let firstError = true;
-  for (const term of list){
-    if (pool.size >= cap*2) break;
-    const before = pool.size;
-    let ricevuti = 0, fuoriPeriodo = 0, errore = null;
-
-    for (let offset=0; offset<200; offset+=50){
-      const q = encodeURIComponent(term+" year:"+from+"-"+to);
-      let url = "/search?q="+q+"&type=track&limit=50&offset="+offset;
-      if (market) url += "&market="+market;
-      let page;
-      try {
-        page = await api(url);
-      } catch(e){
-        errore = e.message;
-        // un solo tentativo di ripiego, senza market: alcuni account lo rifiutano
-        if (market){
-          try { page = await api("/search?q="+q+"&type=track&limit=50&offset="+offset); errore = null; }
-          catch(e2){ errore = e2.message; }
-        }
-        if (errore) break;
-      }
-      const items = (page.tracks && page.tracks.items) || [];
-      ricevuti += items.length;
-      if (!items.length) break;
-      for (const t of items){
-        if (!usable(t)) continue;
-        const y = yearOf(t);
-        if (y >= from && y <= to) pool.set(t.id, t); else fuoriPeriodo++;
-      }
+async function loadMyPlaylists(){
+  const box = $("mineList");
+  box.innerHTML = "<p class='hint' style='margin:0'>Carico…</p>";
+  try {
+    const all = [];
+    let url = "/me/playlists?limit=50";
+    while (url){
+      const page = await api(url);
+      all.push(...page.items.filter(p => p && p.tracks && p.tracks.total));
+      url = page.next;
     }
-
-    if (errore){
-      log("Ricerca « "+term+" » fallita → "+errore, "bad");
-      if (firstError){
-        firstError = false;
-        log("Suggerimento: se l'errore è 403, l'app sul dashboard Spotify è in modalità sviluppo e il tuo account non è fra gli utenti abilitati. Aggiungilo in User Management.", "bad");
-      }
-    } else {
-      log("Ricerca « "+term+" »: "+ricevuti+" risultati, "+(ricevuti-fuoriPeriodo)+" nel periodo → totale "+pool.size, ricevuti ? "good" : "bad");
+    if (!all.length){ box.innerHTML = "<p class='hint' style='margin:0'>Nessuna playlist trovata.</p>"; return; }
+    all.sort((a,b) => b.tracks.total - a.tracks.total);
+    box.innerHTML = "";
+    for (const p of all){
+      const ufficiale = p.owner && p.owner.id === "spotify";
+      const l = document.createElement("label");
+      l.className = "check";
+      l.style.marginBottom = "7px";
+      l.innerHTML = "<input type='checkbox' data-pl='"+p.id+"'"+(ufficiale?" disabled":"")+">"+
+        "<span>"+p.name.replace(/</g,"&lt;")+
+        "<em>"+p.tracks.total+" brani"+(ufficiale?" · playlist Spotify, non leggibile":"")+"</em></span>";
+      box.appendChild(l);
     }
+  } catch(e){
+    box.innerHTML = "<p class='hint' style='margin:0;color:var(--fault)'>"+e.message+"</p>";
   }
+}
+
+function selectedMine(){
+  return Array.from(document.querySelectorAll("#mineList input[data-pl]:checked"))
+              .map(i => i.getAttribute("data-pl"));
 }
 
 function shuffle(arr){
@@ -588,10 +581,11 @@ async function build(){
       if (!lines.length) log("Nessun link di playlist inserito.", "bad");
       else await collectPlaylists(pool, from, to, lines);
     }
-    if ($("srcSearch").checked){
+    if ($("srcMine").checked){
       setVU(.65);
-      const terms = $("searchTerms").value.split(",").map(s=>s.trim()).filter(Boolean);
-      await collectSearch(pool, from, to, terms, cap);
+      const ids = selectedMine();
+      if (!ids.length) log("Nessuna playlist selezionata nell'elenco.", "bad");
+      else await collectPlaylists(pool, from, to, ids);
     }
 
     if (!pool.size){
@@ -692,7 +686,11 @@ async function init(){
   $("btnPlay").onclick = playNow;
   $("btnOpen").onclick = () => { if (lastPlaylist) window.open(lastPlaylist.external_urls.spotify, "_blank"); };
   $("srcPlaylists").onchange = e => $("subPlaylists").classList.toggle("open", e.target.checked);
-  $("srcSearch").onchange = e => $("subSearch").classList.toggle("open", e.target.checked);
+  $("srcMine").onchange = e => {
+    $("subMine").classList.toggle("open", e.target.checked);
+    if (e.target.checked && !$("mineList").children.length) loadMyPlaylists();
+  };
+  $("btnLoadMine").onclick = loadMyPlaylists;
 
   const params = new URLSearchParams(location.search);
   if (params.get("error")){
