@@ -246,6 +246,26 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
 
     <label class="check">
+      <input type="checkbox" id="srcAlbum">
+      <span>Da elenco album
+        <em>Incolla una classifica di album: l'app ne estrae le tracce.</em></span>
+    </label>
+    <div class="sub" id="subAlbum">
+      <textarea id="albumList" style="min-height:130px" placeholder="Oasis - Definitely Maybe&#10;Blur - Parklife&#10;R.E.M. - Automatic for the People" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:9px">
+        <div class="field" style="margin-bottom:0">
+          <label for="tracceAlbum">Tracce per album</label>
+          <input type="number" id="tracceAlbum" value="3" min="0" max="30">
+        </div>
+        <div class="field" style="margin-bottom:0;flex:2">
+          <label>&nbsp;</label>
+          <p class="hint" style="margin:0;padding-top:9px">Le prime tracce sono di solito i singoli estratti. Metti <strong style="color:var(--ink)">0</strong> per prenderle tutte.</p>
+        </div>
+      </div>
+      <p class="hint" style="margin:8px 0 0">Formato <em style="font-style:normal;color:var(--ink)">Artista - Album</em>, uno per riga. Richiede due interrogazioni per album, quindi su liste lunghe serve qualche minuto.</p>
+    </div>
+
+    <label class="check">
       <input type="checkbox" id="srcChart">
       <span>Da classifica (elenco titoli)
         <em>Incolla una classifica di fine anno: l'app cerca ogni brano.</em></span>
@@ -311,7 +331,7 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
   </section>
 
-  <footer>R05 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
+  <footer>R06 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
 </div>
 
 <script>
@@ -648,6 +668,80 @@ async function cercaBrano(titolo, artista, market, incerto){
   return {};
 }
 
+/* ---------- album ---------- */
+async function cercaAlbum(artista, titolo, market){
+  const q = encodeURIComponent('album:"'+titolo.replace(/"/g,"")+'" artist:"'+artista.replace(/"/g,"")+'"');
+  let url = "/search?q="+q+"&type=album&limit=10";
+  if (market) url += "&market="+market;
+  let page;
+  try { page = await api(url); } catch(e){ return {errore:e.message}; }
+  const items = (page.albums && page.albums.items) || [];
+  let best = null, bestP = 0;
+  const nb = normalizza(titolo), na = normalizza(artista);
+  for (const al of items){
+    if (!al || !al.id) continue;
+    const nn = normalizza(al.name);
+    let pt = 0;
+    if (nn === nb) pt += 60; else if (nn.startsWith(nb) || nb.startsWith(nn)) pt += 30; else continue;
+    const artisti = (al.artists||[]).map(a => normalizza(a.name)).join(" ");
+    if (artisti === na) pt += 40; else if (na && artisti.indexOf(na) >= 0) pt += 25; else pt -= 20;
+    const testo = (al.name + " " + ((al.album_type)||"")).toLowerCase();
+    for (const k of SCARTI) if (testo.indexOf(k) >= 0){ pt = -1; break; }
+    if (testo.indexOf("live") >= 0) pt -= 15;
+    if (/deluxe|anniversary|expanded|remaster/.test(testo)) pt -= 8;
+    if (pt > bestP){ bestP = pt; best = al; }
+  }
+  return best ? {album: best} : {};
+}
+
+async function tracceAlbum(album, market){
+  // percorso principale: elenco tracce dell'album
+  try {
+    const page = await api("/albums/"+album.id+"/tracks?limit=50"+(market ? "&market="+market : ""));
+    const items = (page.items || []).filter(t => t && t.id);
+    if (items.length){
+      // le tracce di un album non portano con se' i dati dell'album: glieli attacco
+      items.forEach(t => { t.album = album; t.type = t.type || "track"; });
+      return items;
+    }
+  } catch(e){ /* ripiego sotto */ }
+  // ripiego: ricerca per brano filtrata sull'album
+  const q = encodeURIComponent('album:"'+album.name.replace(/"/g,"")+'" artist:"'+((album.artists||[{}])[0].name||"").replace(/"/g,"")+'"');
+  try {
+    const page = await api("/search?q="+q+"&type=track&limit=10"+(market ? "&market="+market : ""));
+    const items = ((page.tracks && page.tracks.items) || [])
+      .filter(t => usable(t) && normalizza(t.album && t.album.name) === normalizza(album.name));
+    return items;
+  } catch(e){ return []; }
+}
+
+async function collectAlbum(pool, righe, from, to, maxTracce, cap){
+  const market = /^[A-Za-z]{2}$/.test((me && me.country) || "") ? me.country.toUpperCase() : null;
+  let fatti = 0, mancati = [], fuori = 0;
+  for (const riga of righe){
+    if (pool.size >= cap*4){ log("Bacino gia' ampio, interrompo la scansione degli album.", "good"); break; }
+    const voce = leggiRiga(riga);
+    if (!voce) continue;
+    const esito = await cercaAlbum(voce.artista, voce.titolo, market);
+    if (esito.errore){ log("Scansione interrotta: "+esito.errore, "bad"); break; }
+    if (!esito.album){ mancati.push(voce.artista+" - "+voce.titolo); await new Promise(r=>setTimeout(r,110)); continue; }
+    const anno = parseInt((esito.album.release_date||"").slice(0,4),10);
+    if (!(anno >= from && anno <= to)){ fuori++; await new Promise(r=>setTimeout(r,110)); continue; }
+    let tracce = await tracceAlbum(esito.album, market);
+    if (maxTracce > 0) tracce = tracce.slice(0, maxTracce);
+    let aggiunte = 0;
+    for (const t of tracce){ if (t.id && !pool.has(t.id)){ pool.set(t.id, t); aggiunte++; } }
+    if (aggiunte) fatti++;
+    log("« "+esito.album.name+" » ("+(anno||"?")+") → +"+aggiunte+" tracce", aggiunte ? "good" : "bad");
+    await new Promise(r => setTimeout(r, 140));
+  }
+  log("Album elaborati: "+fatti+" · fuori periodo: "+fuori+" · non trovati: "+mancati.length, "good");
+  if (mancati.length){
+    mancati.slice(0,20).forEach(m => log("   non trovato: "+m, "bad"));
+    if (mancati.length > 20) log("   … e altri "+(mancati.length-20), "bad");
+  }
+}
+
 async function collectChart(pool, righe){
   const market = /^[A-Za-z]{2}$/.test((me && me.country) || "") ? me.country.toUpperCase() : null;
   let trovati = 0, mancati = [], illeggibili = 0;
@@ -716,6 +810,13 @@ async function build(){
       const lines = $("playlistUrls").value.split("\n").filter(l => l.trim());
       if (!lines.length) log("Nessun link di playlist inserito.", "bad");
       else await collectPlaylists(pool, from, to, lines);
+    }
+    if ($("srcAlbum").checked){
+      setVU(.4);
+      const righe = $("albumList").value.split("\n").map(x=>x.trim()).filter(Boolean);
+      const maxTracce = Math.max(0, parseInt($("tracceAlbum").value,10) || 0);
+      if (!righe.length) log("Nessun elenco incollato nella casella degli album.", "bad");
+      else await collectAlbum(pool, righe, from, to, maxTracce, cap);
     }
     if ($("srcChart").checked){
       setVU(.45);
@@ -840,6 +941,7 @@ async function init(){
   $("btnLoadMine").onclick = loadMyPlaylists;
   $("srcSearch").onchange = e => $("subSearch").classList.toggle("open", e.target.checked);
   $("srcChart").onchange = e => $("subChart").classList.toggle("open", e.target.checked);
+  $("srcAlbum").onchange = e => $("subAlbum").classList.toggle("open", e.target.checked);
 
   const params = new URLSearchParams(location.search);
   if (params.get("error")){
