@@ -331,7 +331,7 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
   </section>
 
-  <footer>R06 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
+  <footer>R07 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
 </div>
 
 <script>
@@ -453,23 +453,42 @@ async function refresh(){
   store.set("sp_tokens", JSON.stringify(tokens));
 }
 
+/* ---------- ritmo delle richieste ---------- */
+const ritmo = {
+  pausa: 350,          // ms fra una richiesta e l'altra, si adatta da solo
+  ultima: 0,
+  async attendi(){
+    const resta = this.pausa - (Date.now() - this.ultima);
+    if (resta > 0) await new Promise(r => setTimeout(r, resta));
+    this.ultima = Date.now();
+  },
+  rallenta(){ this.pausa = Math.min(3000, Math.round(this.pausa * 1.6)); },
+  accelera(){ this.pausa = Math.max(250, Math.round(this.pausa * 0.97)); }
+};
+
 /* ---------- API helper ---------- */
 async function api(path, opts){
   opts = opts || {};
   if (tokens && Date.now() > tokens.expires_at) await refresh();
-  const doCall = async () => fetch(path.startsWith("http") ? path : API+path, {
-    method: opts.method || "GET",
-    headers: Object.assign({Authorization:"Bearer "+tokens.access_token}, opts.body ? {"Content-Type":"application/json"} : {}),
-    body: opts.body ? JSON.stringify(opts.body) : undefined
-  });
+  const doCall = async () => {
+    await ritmo.attendi();
+    return fetch(path.startsWith("http") ? path : API+path, {
+      method: opts.method || "GET",
+      headers: Object.assign({Authorization:"Bearer "+tokens.access_token}, opts.body ? {"Content-Type":"application/json"} : {}),
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+  };
   let r = await doCall();
   if (r.status === 401){ await refresh(); r = await doCall(); }
-  if (r.status === 429){
-    const wait = (parseInt(r.headers.get("Retry-After")||"2",10)+1)*1000;
-    log("Spotify chiede una pausa di "+Math.round(wait/1000)+"s…");
-    await new Promise(res => setTimeout(res, wait));
+  // il 429 non e' un errore: e' Spotify che chiede di rallentare. Si insiste.
+  for (let tentativo = 1; r.status === 429 && tentativo <= 6; tentativo++){
+    const attesa = Math.min(90, parseInt(r.headers.get("Retry-After")||"3",10) + tentativo) * 1000;
+    ritmo.rallenta();
+    log("Spotify chiede una pausa di "+Math.round(attesa/1000)+"s (tentativo "+tentativo+"/6, ritmo ora "+ritmo.pausa+"ms)");
+    await new Promise(res => setTimeout(res, attesa));
     r = await doCall();
   }
+  if (r.ok) ritmo.accelera();
   if (r.status === 204) return null;
   if (!r.ok){
     let detail = "";
@@ -694,6 +713,31 @@ async function cercaAlbum(artista, titolo, market){
   return best ? {album: best} : {};
 }
 
+// quando servono poche tracce basta una sola interrogazione: la ricerca
+// per brano filtrata sull'album restituisce gia' i dati completi, anno compreso
+async function albumInUnColpo(artista, titolo, market, quante){
+  const q = encodeURIComponent('album:"'+titolo.replace(/"/g,"")+'" artist:"'+artista.replace(/"/g,"")+'"');
+  let url = "/search?q="+q+"&type=track&limit=10";
+  if (market) url += "&market="+market;
+  let page;
+  try { page = await api(url); } catch(e){ return {errore:e.message}; }
+  const items = ((page.tracks && page.tracks.items) || []).filter(usable);
+  if (!items.length) return {};
+  const nb = normalizza(titolo), na = normalizza(artista);
+  const buoni = items.filter(t => {
+    const nn = normalizza(t.album && t.album.name);
+    if (!(nn === nb || nn.startsWith(nb) || nb.startsWith(nn))) return false;
+    const artisti = (t.artists||[]).map(a => normalizza(a.name)).join(" ");
+    if (na && artisti.indexOf(na) < 0) return false;
+    const testo = (t.name + " " + ((t.album && t.album.name)||"")).toLowerCase();
+    for (const k of SCARTI) if (testo.indexOf(k) >= 0) return false;
+    return true;
+  });
+  if (!buoni.length) return {};
+  buoni.sort((x,y) => (x.track_number||99) - (y.track_number||99));
+  return {album: buoni[0].album, tracce: buoni.slice(0, quante)};
+}
+
 async function tracceAlbum(album, market){
   // percorso principale: elenco tracce dell'album
   try {
@@ -717,23 +761,47 @@ async function tracceAlbum(album, market){
 
 async function collectAlbum(pool, righe, from, to, maxTracce, cap){
   const market = /^[A-Za-z]{2}$/.test((me && me.country) || "") ? me.country.toUpperCase() : null;
-  let fatti = 0, mancati = [], fuori = 0;
+  let fatti = 0, mancati = [], fuori = 0, erroriDiFila = 0, totale = righe.length, i = 0;
+  const rapido = maxTracce > 0 && maxTracce <= 10;   // una richiesta invece di due
+  if (rapido) log("Modalità rapida: una sola interrogazione per album.");
+
   for (const riga of righe){
-    if (pool.size >= cap*4){ log("Bacino gia' ampio, interrompo la scansione degli album.", "good"); break; }
+    i++;
+    if (pool.size >= cap*4){ log("Bacino già ampio, interrompo la scansione degli album.", "good"); break; }
     const voce = leggiRiga(riga);
     if (!voce) continue;
-    const esito = await cercaAlbum(voce.artista, voce.titolo, market);
-    if (esito.errore){ log("Scansione interrotta: "+esito.errore, "bad"); break; }
-    if (!esito.album){ mancati.push(voce.artista+" - "+voce.titolo); await new Promise(r=>setTimeout(r,110)); continue; }
-    const anno = parseInt((esito.album.release_date||"").slice(0,4),10);
-    if (!(anno >= from && anno <= to)){ fuori++; await new Promise(r=>setTimeout(r,110)); continue; }
-    let tracce = await tracceAlbum(esito.album, market);
+
+    let album = null, tracce = null, errore = null;
+    if (rapido){
+      const e = await albumInUnColpo(voce.artista, voce.titolo, market, maxTracce);
+      errore = e.errore; album = e.album; tracce = e.tracce;
+    } else {
+      const e = await cercaAlbum(voce.artista, voce.titolo, market);
+      errore = e.errore; album = e.album;
+      if (album){
+        const anno0 = parseInt((album.release_date||"").slice(0,4),10);
+        if (anno0 >= from && anno0 <= to) tracce = await tracceAlbum(album, market);
+        else { fuori++; continue; }
+      }
+    }
+
+    if (errore){
+      erroriDiFila++;
+      log("Riga "+i+"/"+totale+" fallita → "+errore, "bad");
+      if (erroriDiFila >= 4){ log("Quattro errori di fila: mi fermo qui. I brani raccolti finora restano validi.", "bad"); break; }
+      continue;
+    }
+    erroriDiFila = 0;
+
+    if (!album || !tracce || !tracce.length){ mancati.push(voce.artista+" - "+voce.titolo); continue; }
+    const anno = parseInt((album.release_date||"").slice(0,4),10);
+    if (!(anno >= from && anno <= to)){ fuori++; continue; }
     if (maxTracce > 0) tracce = tracce.slice(0, maxTracce);
+
     let aggiunte = 0;
     for (const t of tracce){ if (t.id && !pool.has(t.id)){ pool.set(t.id, t); aggiunte++; } }
     if (aggiunte) fatti++;
-    log("« "+esito.album.name+" » ("+(anno||"?")+") → +"+aggiunte+" tracce", aggiunte ? "good" : "bad");
-    await new Promise(r => setTimeout(r, 140));
+    log("["+i+"/"+totale+"] « "+album.name+" » ("+(anno||"?")+") → +"+aggiunte, aggiunte ? "good" : "bad");
   }
   log("Album elaborati: "+fatti+" · fuori periodo: "+fuori+" · non trovati: "+mancati.length, "good");
   if (mancati.length){
