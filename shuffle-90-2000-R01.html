@@ -246,6 +246,16 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
 
     <label class="check">
+      <input type="checkbox" id="srcChart">
+      <span>Da classifica (elenco titoli)
+        <em>Incolla una classifica di fine anno: l'app cerca ogni brano.</em></span>
+    </label>
+    <div class="sub" id="subChart">
+      <textarea id="chartList" style="min-height:130px" placeholder="Oasis - Wonderwall&#10;Coolio - Gangsta's Paradise&#10;1  &quot;Believe&quot;  Cher" spellcheck="false"></textarea>
+      <p class="hint" style="margin:6px 0 0">Un brano per riga. Vanno bene sia <em style="font-style:normal;color:var(--ink)">Artista - Titolo</em> sia le righe copiate da una tabella di Wikipedia, numero compreso. Questa sorgente ignora il filtro anni: una classifica del 1995 contiene per definizione brani del 1995, anche se l'edizione su Spotify è una rimasterizzazione successiva.</p>
+    </div>
+
+    <label class="check">
       <input type="checkbox" id="srcSearch">
       <span>Cerca nel catalogo Spotify
         <em>Pesca brani nuovi per te dentro il periodo scelto.</em></span>
@@ -301,7 +311,7 @@ footer{text-align:center;font-size:12px;color:#636A77;margin-top:22px}
     </div>
   </section>
 
-  <footer>R04 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
+  <footer>R05 · funziona solo se la pagina è aperta dall'indirizzo registrato nel Redirect URI</footer>
 </div>
 
 <script>
@@ -574,6 +584,91 @@ async function collectSearch(pool, from, to, terms, cap){
   }
 }
 
+/* ---------- classifiche ---------- */
+const SCARTI = ["karaoke","tribute","made famous","cover version","instrumental","8-bit","lullaby","workout","originally performed"];
+const PENALITA = ["live","remaster","remastered","remix","acoustic","demo","edit","version","mix","rerecorded","re-recorded","taylor's version"];
+
+function normalizza(t){
+  return (t||"").toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+    .replace(/\(.*?\)|\[.*?\]/g," ")
+    .replace(/\b(feat|ft|featuring|with)\b.*$/,"")
+    .replace(/[^a-z0-9 ]/g," ")
+    .replace(/\s+/g," ").trim();
+}
+
+// accetta "Artista - Titolo", "Titolo - Artista" e le righe copiate dalle tabelle
+function leggiRiga(riga){
+  let r = riga.trim().replace(/^\s*\d+\s*[.)\-–]?\s+/, "");
+  if (!r) return null;
+  let campi;
+  if (r.indexOf("\t") >= 0) campi = r.split("\t").map(x=>x.trim()).filter(x => x && !/^\d+$/.test(x));
+  else campi = r.split(/\s+[-–—]\s+/).map(x=>x.trim()).filter(Boolean);
+  if (campi.length < 2) return null;
+  // il campo fra virgolette, se c'e', e' il titolo
+  let a = campi[0], b = campi[1];
+  const virg = x => /^["«“'].*["»”']$/.test(x);
+  const pulisci = x => x.replace(/^["«“']|["»”']$/g,"").trim();
+  if (virg(a)) return {titolo: pulisci(a), artista: pulisci(b)};
+  if (virg(b)) return {titolo: pulisci(b), artista: pulisci(a)};
+  return {artista: pulisci(a), titolo: pulisci(b), incerto: true};
+}
+
+function punteggio(t, titolo, artista){
+  const nt = normalizza(t.name), nb = normalizza(titolo);
+  let p = 0;
+  if (nt === nb) p += 60; else if (nt.startsWith(nb) || nb.startsWith(nt)) p += 35; else return -1;
+  const artisti = (t.artists||[]).map(a => normalizza(a.name)).join(" ");
+  const na = normalizza(artista);
+  if (artisti === na) p += 40; else if (na && artisti.indexOf(na) >= 0) p += 25; else p -= 20;
+  const testo = (t.name + " " + ((t.album && t.album.name) || "")).toLowerCase();
+  for (const k of SCARTI) if (testo.indexOf(k) >= 0) return -1;
+  for (const k of PENALITA) if (testo.indexOf(k) >= 0) p -= 12;
+  return p;
+}
+
+async function cercaBrano(titolo, artista, market, incerto){
+  const prove = [{t:titolo, a:artista}];
+  if (incerto) prove.push({t:artista, a:titolo});   // ordine invertito
+  for (const prova of prove){
+    const q = encodeURIComponent('track:"'+prova.t.replace(/"/g,"")+'" artist:"'+prova.a.replace(/"/g,"")+'"');
+    let url = "/search?q="+q+"&type=track&limit=10";
+    if (market) url += "&market="+market;
+    let page;
+    try { page = await api(url); } catch(e){ return {errore:e.message}; }
+    const items = (page.tracks && page.tracks.items) || [];
+    let best = null, bestP = 0;
+    for (const t of items){
+      if (!usable(t)) continue;
+      const pt = punteggio(t, prova.t, prova.a);
+      if (pt > bestP){ bestP = pt; best = t; }
+    }
+    if (best) return {brano: best};
+  }
+  return {};
+}
+
+async function collectChart(pool, righe){
+  const market = /^[A-Za-z]{2}$/.test((me && me.country) || "") ? me.country.toUpperCase() : null;
+  let trovati = 0, mancati = [], illeggibili = 0;
+  for (const riga of righe){
+    const voce = leggiRiga(riga);
+    if (!voce){ illeggibili++; continue; }
+    const esito = await cercaBrano(voce.titolo, voce.artista, market, voce.incerto);
+    if (esito.errore){ log("Ricerca interrotta: "+esito.errore, "bad"); break; }
+    if (esito.brano){ pool.set(esito.brano.id, esito.brano); trovati++; }
+    else mancati.push(voce.artista+" - "+voce.titolo);
+    await new Promise(r => setTimeout(r, 110));
+  }
+  log("Classifica: "+trovati+" brani abbinati su "+righe.length+" righe", trovati ? "good" : "bad");
+  if (illeggibili) log(illeggibili+" righe non interpretabili (manca il separatore fra artista e titolo)", "bad");
+  if (mancati.length){
+    log("Non trovati su Spotify ("+mancati.length+"):", "bad");
+    mancati.slice(0,25).forEach(m => log("   · "+m, "bad"));
+    if (mancati.length > 25) log("   … e altri "+(mancati.length-25), "bad");
+  }
+}
+
 function selectedMine(){
   return Array.from(document.querySelectorAll("#mineList input[data-pl]:checked"))
               .map(i => i.getAttribute("data-pl"));
@@ -621,6 +716,12 @@ async function build(){
       const lines = $("playlistUrls").value.split("\n").filter(l => l.trim());
       if (!lines.length) log("Nessun link di playlist inserito.", "bad");
       else await collectPlaylists(pool, from, to, lines);
+    }
+    if ($("srcChart").checked){
+      setVU(.45);
+      const righe = $("chartList").value.split("\n").map(x=>x.trim()).filter(Boolean);
+      if (!righe.length) log("Nessun elenco incollato nella casella della classifica.", "bad");
+      else await collectChart(pool, righe);
     }
     if ($("srcSearch").checked){
       setVU(.7);
@@ -738,6 +839,7 @@ async function init(){
   };
   $("btnLoadMine").onclick = loadMyPlaylists;
   $("srcSearch").onchange = e => $("subSearch").classList.toggle("open", e.target.checked);
+  $("srcChart").onchange = e => $("subChart").classList.toggle("open", e.target.checked);
 
   const params = new URLSearchParams(location.search);
   if (params.get("error")){
